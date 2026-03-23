@@ -1,0 +1,10 @@
+{
+  "name": "autohealer-action",
+  "version": "1.0.0",
+  "description": "AI-powered self-healing CI/CD GitHub Action",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0"
+  }
+}
