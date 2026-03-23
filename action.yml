@@ -1,0 +1,198 @@
+name: "AutoHealer — AI Self-Healing CI/CD"
+description: "Detects pipeline failures, analyses logs with Claude AI, raises a fix PR and asks for approval before merging anything."
+author: "YOUR_USERNAME"
+
+branding:
+  icon: "zap"
+  color: "orange"
+
+# ── Inputs ────────────────────────────────────────────────────────────────────
+inputs:
+
+  anthropic_api_key:
+    description: "Anthropic API key (from console.anthropic.com)"
+    required: true
+
+  gh_token:
+    description: "GitHub PAT with Contents + Pull requests + Workflows write. Must be a PAT — not GITHUB_TOKEN — so the merged fix triggers the pipeline again."
+    required: true
+
+  slack_token:
+    description: "Slack bot token for notifications (optional)"
+    required: false
+    default: ""
+
+  slack_channel:
+    description: "Slack channel ID for notifications (optional)"
+    required: false
+    default: ""
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+outputs:
+
+  pr_url:
+    description: "URL of the fix PR that was opened"
+    value: ${{ steps.create-pr.outputs.pr_url }}
+
+  pr_number:
+    description: "Number of the fix PR that was opened"
+    value: ${{ steps.create-pr.outputs.pr_number }}
+
+  confidence:
+    description: "Claude's confidence level: high | medium | low"
+    value: ${{ steps.analyse.outputs.confidence }}
+
+  fix_type:
+    description: "Type of fix: code | config | dependency | env | security | manual"
+    value: ${{ steps.analyse.outputs.fix_type }}
+
+# ── Implementation ─────────────────────────────────────────────────────────────
+# Composite action — runs directly on the caller's runner, no Docker needed.
+# Scripts are referenced via ${{ github.action_path }} so they always resolve
+# to this repo regardless of where the action is called from.
+runs:
+  using: "composite"
+
+  steps:
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install AutoHealer dependencies
+      shell: bash
+      run: |
+        cd "${{ github.action_path }}"
+        npm install --silent
+
+    # ── 1. Download failure logs ────────────────────────────────────────────
+    - name: Download failure logs
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        FAILED_RUN_ID: ${{ github.run_id }}
+        REPO: ${{ github.repository }}
+      run: |
+        echo "▶ AutoHealer: fetching logs for run $FAILED_RUN_ID"
+
+        gh api repos/$REPO/actions/runs/$FAILED_RUN_ID/jobs \
+          --jq '[.jobs[] | select(.conclusion=="failure") | {job:.name, steps:[.steps[] | select(.conclusion=="failure") | .name]}]' \
+          > /tmp/autohealer-failed-jobs.json
+
+        echo "Failed jobs:"
+        cat /tmp/autohealer-failed-jobs.json
+
+        # Primary: gh run view --log-failed (no zip, no redirect handling)
+        gh run view "$FAILED_RUN_ID" \
+          --repo "$REPO" \
+          --log-failed \
+          > /tmp/autohealer-failure-logs.txt 2>/dev/null || true
+
+        # Fallback A: per-job log API (plain text directly)
+        if [ ! -s /tmp/autohealer-failure-logs.txt ]; then
+          echo "▶ --log-failed empty, trying per-job log API..."
+          gh api repos/$REPO/actions/runs/$FAILED_RUN_ID/jobs \
+            --jq '.jobs[] | select(.conclusion=="failure") | .id' \
+          | while read -r JOB_ID; do
+              echo "=== JOB $JOB_ID ===" >> /tmp/autohealer-failure-logs.txt
+              gh api repos/$REPO/actions/jobs/$JOB_ID/logs \
+                -H "Accept: application/vnd.github+json" \
+                >> /tmp/autohealer-failure-logs.txt 2>/dev/null || true
+            done
+        fi
+
+        # Fallback B: metadata only
+        if [ ! -s /tmp/autohealer-failure-logs.txt ]; then
+          echo "▶ All log methods failed — using metadata only"
+          echo "Log download failed. Failed jobs:" > /tmp/autohealer-failure-logs.txt
+          cat /tmp/autohealer-failed-jobs.json    >> /tmp/autohealer-failure-logs.txt
+        fi
+
+        # Cap at 50 KB to stay within Claude's context window
+        python3 -c "
+        data = open('/tmp/autohealer-failure-logs.txt', 'rb').read()
+        if len(data) > 51200:
+            open('/tmp/autohealer-failure-logs.txt', 'wb').write(data[-51200:])
+            print(f'Trimmed to 50 KB (was {len(data)} bytes)')
+        else:
+            print(f'Log size: {len(data)} bytes')
+        "
+
+    # ── 2. Collect code context ──────────────────────────────────────────────
+    - name: Collect code context
+      shell: bash
+      run: |
+        git diff --name-only HEAD~1 HEAD 2>/dev/null \
+          > /tmp/autohealer-changed-files.txt \
+          || echo "(first commit)" > /tmp/autohealer-changed-files.txt
+
+        git log --oneline -10 > /tmp/autohealer-recent-commits.txt
+
+        touch /tmp/autohealer-code-context.txt
+        while IFS= read -r f; do
+          if [ -f "$f" ] && [[ "$f" != node_modules* ]]; then
+            echo "=== FILE: $f ===" >> /tmp/autohealer-code-context.txt
+            cat "$f"               >> /tmp/autohealer-code-context.txt
+            echo ""                >> /tmp/autohealer-code-context.txt
+          fi
+        done < /tmp/autohealer-changed-files.txt
+
+        python3 -c "
+        content = open('/tmp/autohealer-code-context.txt').read()
+        if len(content) > 20480:
+            open('/tmp/autohealer-code-context.txt','w').write(content[-20480:])
+        " 2>/dev/null || true
+
+        cat package.json > /tmp/autohealer-package-context.txt 2>/dev/null \
+          || echo "{}" > /tmp/autohealer-package-context.txt
+
+        echo "Context: $(wc -l < /tmp/autohealer-changed-files.txt) files, $(wc -c < /tmp/autohealer-code-context.txt) bytes"
+
+    # ── 3. Claude analysis ───────────────────────────────────────────────────
+    - name: AI analysis
+      id: analyse
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+      run: |
+        node "${{ github.action_path }}/src/analyze-failure.mjs" \
+          --logs     /tmp/autohealer-failure-logs.txt \
+          --context  /tmp/autohealer-code-context.txt \
+          --commits  /tmp/autohealer-recent-commits.txt \
+          --changed  /tmp/autohealer-changed-files.txt \
+          --package  /tmp/autohealer-package-context.txt \
+          --output   /tmp/autohealer-analysis.json
+
+        CONFIDENCE=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('/tmp/autohealer-analysis.json','utf8')).confidence)")
+        FIX_TYPE=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('/tmp/autohealer-analysis.json','utf8')).fixType)")
+        echo "confidence=$CONFIDENCE" >> $GITHUB_OUTPUT
+        echo "fix_type=$FIX_TYPE"     >> $GITHUB_OUTPUT
+
+    # ── 4. Create fix branch → patch → PR → notify ──────────────────────────
+    - name: Create fix PR and notify
+      id: create-pr
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        SLACK_BOT_TOKEN: ${{ inputs.slack_token }}
+        SLACK_CHANNEL_ID: ${{ inputs.slack_channel }}
+        PIPELINE_ACTOR: ${{ github.actor }}
+        HEAD_SHA: ${{ github.sha }}
+        HEAD_BRANCH: ${{ github.ref_name }}
+        REPO: ${{ github.repository }}
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        node "${{ github.action_path }}/src/create-pr.mjs" \
+          --analysis /tmp/autohealer-analysis.json \
+          --run-id   "$RUN_ID" \
+          --actor    "$PIPELINE_ACTOR" \
+          --sha      "$HEAD_SHA" \
+          --branch   "$HEAD_BRANCH" \
+          --repo     "$REPO" \
+          --output   /tmp/autohealer-pr-result.json
+
+        PR_URL=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('/tmp/autohealer-pr-result.json','utf8')).url)")
+        PR_NUM=$(node -e "process.stdout.write(String(JSON.parse(require('fs').readFileSync('/tmp/autohealer-pr-result.json','utf8')).number))")
+        echo "pr_url=$PR_URL"     >> $GITHUB_OUTPUT
+        echo "pr_number=$PR_NUM"  >> $GITHUB_OUTPUT
