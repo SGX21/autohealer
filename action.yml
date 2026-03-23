@@ -1,6 +1,6 @@
 name: "AutoHealer — AI Self-Healing CI/CD"
 description: "Detects pipeline failures, analyses logs with Claude AI, raises a fix PR and asks for approval before merging anything."
-author: "YOUR_USERNAME"
+author: "SGX21"
 
 branding:
   icon: "zap"
